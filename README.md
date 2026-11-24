@@ -17,7 +17,10 @@ FastAPI + SQLite（账存）+ Docker Compose 启动。
 | 退单/撤销重送不重复记账 | 同批号+退单号+同号段重放原单（`idempotent=true`）；撤销重放原撤销结果，均不产生新账目行 |
 | 下游按批查询逐单冲减/冲回明细 | `GET /api/batches/{batch_no}/ledger`，含逐单流水、逐段金额、逐单余额 |
 | **全程不逐张展开票号** | 号段表只有首尾两列；号段金额用 O(1) 区间公式（加分区间交集大小），无逐票行、无逐票循环 |
-| **核对重叠不遍历该批历史退单** | 区间重叠 SQL `first_ticket <= ? AND last_ticket >= ?` 走复合索引（`EXPLAIN QUERY PLAN` 为 `SEARCH ... USING INDEX`），按批索引定位候选，应用层不加载历史退单 |
+| **核对重叠不遍历该批历史/撤销退单** | active 号段由触发器物化到 `occupied_ranges`（撤销即删行）；重叠核查只取 `first_ticket <= ?` 的最大首号前驱一行，尾号判断在应用层完成，走覆盖索引单次定位（`EXPLAIN QUERY PLAN` 为 `SEARCH ... USING COVERING INDEX`）。单段工作量 O(log active 段数)，不随同批已撤销或不相交号段数线性增长 |
+| **旧 SQLite 库直接升级** | 启动时 `init_db()` 幂等执行 `CREATE ... IF NOT EXISTS` 并把旧库 active 退单号段回填进 `occupied_ranges`；原表/历史退单/账目完全保留 |
+
+为什么只查“最大首号前驱”一行：同批 active 号段两两不相交且有序，若首号不超过 `last` 的最后一个号段在 `first` 之前结束，则更早的号段也都在左侧，不可能重叠。注意 `last_ticket >= ?` 不能放进 SQL WHERE——否则前驱不满足时 SQLite 会沿索引回溯全部不相交号段，重新退化成线性扫描。
 
 并发写者在 `BEGIN IMMEDIATE` 处串行（WAL + `busy_timeout=30s`），
 消除“先查后写”的时序窗口：并发重叠退票只有一单成功，并发撤销只入账一次。

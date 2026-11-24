@@ -2,12 +2,16 @@
 
 关键不变量
 ==========
-1. 票号永不逐张展开：号段只存首尾；重叠判定走带索引的区间 SQL（按批索引定位，
-   不把该批历史退单读进内存逐条遍历）；号段金额走 ``allocation`` 的 O(1) 公式。
-2. 号段状态与账目明细在同一 ``BEGIN IMMEDIATE`` 事务内提交，任何一步失败整体
-   回滚，原账保留。
+1. 票号永不逐张展开：号段只存首尾；重叠判定走 active 占用表
+   ``occupied_ranges`` 的“最大首号前驱”单次索引定位（见
+   ``_find_active_overlap``），不把该批历史/已撤销退单读进内存逐条遍历，
+   单段核查工作量为 O(log active 号段数)，不随同批已撤销或不相交号段数
+   线性增长；号段金额走 ``allocation`` 的 O(1) 公式。
+2. 号段状态与账目明细在同一 ``BEGIN IMMEDIATE`` 事务内提交，占用表由
+   触发器随号段写入/状态翻转维护；任何一步失败整体回滚，原账与占用保留。
 3. 重送幂等：同批号 + 同退单号 + 同号段直接回放原单，不产生新账目行。
-4. 撤销按建单时固化的原金额冲回，释放原号段（status -> revoked）。
+4. 撤销按建单时固化的原金额冲回，释放原号段（status -> revoked，
+   触发器同步删除 occupied_ranges 行；refund_segments 历史行保留）。
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import sqlite3
 from fastapi import HTTPException, status
 
 from . import allocation
-from .database import get_conn, write_tx
+from .database import ensure_occupancy_schema, get_conn, write_tx
 from .schemas import (
     BatchCreate,
     BatchLedgerOut,
@@ -356,25 +360,45 @@ def _order_segments(conn: sqlite3.Connection, order_id: int) -> list[sqlite3.Row
 def _find_active_overlap(
     conn: sqlite3.Connection, batch_no: str, first_no: int, last_no: int
 ) -> sqlite3.Row | None:
-    """区间重叠的索引查询。
+    """区间重叠核查：单次覆盖索引定位，工作量不随历史号段数线性增长。
 
-    两闭区间 [a,b] 与 [c,d] 重叠当且仅当 ``a <= d AND c <= b``。
-    走 (batch_no, first_ticket, last_ticket) 复合索引按批定位候选，
-    不读取/遍历该批全部历史退单。JOIN 仅保留未撤销（active）退单的号段。
+    同批 active 号段两两不相交。对申请区间 ``[first_no, last_no]``，
+    取 ``first_ticket <= last_no`` 中首号最大的一条 active 号段（前驱）：
+
+    * 若该前驱的 ``last_ticket >= first_no``，二者重叠，返回它；
+    * 否则它完全落在申请区间左侧；更早的号段尾号更小（不相交且有序），
+      不可能重叠，直接返回 None。
+
+    已撤销号段由触发器从 ``occupied_ranges`` 删除，故同批撤销单积得再多
+    也不增加本查询的工作量；大量与本单不相交的 active 号段也只贡献
+    B 树深度（O(log n)），不会被逐行扫描。
+
+    关键：``last_ticket >= first_no`` 只能在取回首行后于应用层判断。
+    若放进 SQL WHERE，当前驱不满足时 SQLite 会沿索引继续回溯全部不相交
+    号段，重新退化成 O(n) 扫描。
     """
-    return conn.execute(
-        """
-        SELECT ro.refund_no, rs.first_ticket, rs.last_ticket
-        FROM refund_segments AS rs
-        JOIN refund_orders AS ro ON ro.id = rs.order_id
-        WHERE rs.batch_no = ?
-          AND ro.status = 'active'
-          AND rs.first_ticket <= ?
-          AND rs.last_ticket  >= ?
+    sql = """
+        SELECT refund_no, first_ticket, last_ticket
+        FROM occupied_ranges
+        WHERE batch_no = ?
+          AND first_ticket <= ?
+        ORDER BY first_ticket DESC
         LIMIT 1
-        """,
-        (batch_no, last_no, first_no),
-    ).fetchone()
+        """
+    params = (batch_no, last_no)
+    try:
+        predecessor = conn.execute(sql, params).fetchone()
+    except sqlite3.OperationalError as exc:
+        # 直接在“仅初版结构”的旧库连接上调用本函数、尚未经过 init_db
+        # 升级时的惰性补救：补齐占用表并回填后重试一次。
+        if "occupied_ranges" not in str(exc):
+            raise
+        ensure_occupancy_schema(conn)
+        predecessor = conn.execute(sql, params).fetchone()
+
+    if predecessor is not None and predecessor["last_ticket"] >= first_no:
+        return predecessor
+    return None
 
 
 def _append_ledger(
